@@ -17,9 +17,15 @@
     <PackageProjectUrl>https://github.com/CloakHQ/CloakBrowser</PackageProjectUrl>
     <RepositoryUrl>https://github.com/CloakHQ/CloakBrowser</RepositoryUrl>
     <PackageTags>stealth;browser;chromium;playwright;scraping;web-scraping;anti-detect;antidetect;undetected;bot-detection;fingerprint;recaptcha;cloudflare;turnstile;datadome;captcha;headless;automation</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <NoWarn>$(NoWarn);CS1591</NoWarn>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- dotnet/README.md feeds the NuGet package page. -->
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Playwright" Version="1.49.0" />

@@ -14,6 +14,7 @@ on:
           - ''
           - publish-pypi
           - publish-npm
+          - publish-nuget
           - publish-docker
 
 concurrency:
@@ -37,6 +38,11 @@ jobs:
           node-version: 22
       - name: JavaScript tests
         run: cd js && npm ci && npm run build && npm test
+      - uses: actions/setup-dotnet@9a946fdbd5fb07b82b2f5a4466058b876ab72bb2  # v5.3.0
+        with:
+          dotnet-version: '8.0.x'
+      - name: .NET tests
+        run: dotnet test dotnet/CloakBrowser.sln -c Release
 
   validate-version:
     if: startsWith(github.ref, 'refs/tags/')
@@ -51,13 +57,15 @@ jobs:
           TAG="${GITHUB_REF_NAME#v}"
           PY=$(python -c 'import re; print(re.search(r"__version__\s*=\s*[\"'\'']([^\"'\'']+)", open("cloakbrowser/_version.py").read()).group(1))')
           JS=$(python -c 'import json; print(json.load(open("js/package.json"))["version"])')
-          echo "Tag: $TAG | Python: $PY | npm: $JS"
+          NET=$(python -c 'import re; print(re.search(r"<Version>([^<]+)", open("dotnet/src/CloakBrowser/CloakBrowser.csproj").read()).group(1))')
+          echo "Tag: $TAG | Python: $PY | npm: $JS | .NET: $NET"
           [ "$TAG" = "$PY" ] || { echo "ERROR: tag v$TAG != _version.py $PY"; exit 1; }
           [ "$TAG" = "$JS" ] || { echo "ERROR: tag v$TAG != package.json $JS"; exit 1; }
+          [ "$TAG" = "$NET" ] || { echo "ERROR: tag v$TAG != CloakBrowser.csproj $NET"; exit 1; }
 
   publish-pypi:
     needs: [test, validate-version]
-    if: always() && needs.test.result == 'success' && (needs.validate-version.result == 'success' || needs.validate-version.result == 'skipped')
+    if: always() && needs.test.result == 'success' && (needs.validate-version.result == 'success' || needs.validate-version.result == 'skipped') && (github.event.inputs.job == '' || github.event.inputs.job == 'publish-pypi')
     runs-on: ubuntu-latest
     permissions:
       id-token: write  # OIDC trusted publishing — no PYPI_TOKEN needed
@@ -75,7 +83,7 @@ jobs:
 
   publish-npm:
     needs: [test, validate-version]
-    if: always() && needs.test.result == 'success' && (needs.validate-version.result == 'success' || needs.validate-version.result == 'skipped')
+    if: always() && needs.test.result == 'success' && (needs.validate-version.result == 'success' || needs.validate-version.result == 'skipped') && (github.event.inputs.job == '' || github.event.inputs.job == 'publish-npm')
     runs-on: ubuntu-latest
     permissions:
       id-token: write  # OIDC trusted publishing + provenance — no NPM_TOKEN needed
@@ -90,9 +98,30 @@ jobs:
       - name: Publish to npm
         run: cd js && npm publish --provenance --access public
 
+  publish-nuget:
+    needs: [test, validate-version]
+    if: always() && needs.test.result == 'success' && (needs.validate-version.result == 'success' || needs.validate-version.result == 'skipped') && (github.event.inputs.job == '' || github.event.inputs.job == 'publish-nuget')
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write  # OIDC trusted publishing — no NUGET_API_KEY secret needed
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+      - uses: actions/setup-dotnet@9a946fdbd5fb07b82b2f5a4466058b876ab72bb2  # v5.3.0
+        with:
+          dotnet-version: '8.0.x'
+      - name: NuGet login (OIDC trusted publishing)
+        id: nuget-login
+        uses: NuGet/login@8d196754b4036150537f80ac539e15c2f1028841  # v1.2.0
+        with:
+          user: CloakHQ
+      - name: Pack
+        run: dotnet pack dotnet/src/CloakBrowser/CloakBrowser.csproj -c Release -o out
+      - name: Publish to NuGet
+        run: dotnet nuget push out/*.nupkg --api-key ${{ steps.nuget-login.outputs.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
+
   publish-docker:
     needs: [test, validate-version]
-    if: always() && needs.test.result == 'success' && (needs.validate-version.result == 'success' || needs.validate-version.result == 'skipped')
+    if: always() && needs.test.result == 'success' && (needs.validate-version.result == 'success' || needs.validate-version.result == 'skipped') && (github.event.inputs.job == '' || github.event.inputs.job == 'publish-docker')
     runs-on: ubuntu-latest
     permissions:
       id-token: write      # Cosign keyless signing + attestations
