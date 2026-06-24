@@ -122,6 +122,8 @@ dotnet add package CloakBrowser
 
 > Community-maintained .NET client built on Microsoft.Playwright. See [`dotnet/README.md`](dotnet/README.md) for the full API.
 
+---
+
 On first run, the stealth Chromium binary is automatically downloaded (~200MB, cached locally).
 
 **Optional:** Auto-detect timezone/locale from proxy IP:
@@ -1377,3 +1379,13 @@ Issues and PRs welcome. If something isn't working, [open an issue](https://gith
 - [@sparanoid](https://github.com/sparanoid) — Docker Xvfb lock cleanup
 - [@Kumario1](https://github.com/Kumario1) — cloakserve idle cleanup for seeded profiles
 - [@0xlally](https://github.com/0xlally) — security reports (cloakserve path traversal, WebSocket origin bypass)
+
+## Star History
+
+<a href="https://www.star-history.com/?repos=CloakHQ%2FCloakBrowser&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=CloakHQ/CloakBrowser&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=CloakHQ/CloakBrowser&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=CloakHQ/CloakBrowser&type=date&legend=top-left" />
+ </picture>
+</a>
