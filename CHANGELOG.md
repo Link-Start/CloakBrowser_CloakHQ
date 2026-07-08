@@ -8,6 +8,8 @@ Changes are tagged: **[wrapper]** for Python/JS wrapper, **[binary]** for Chromi
 
 ## [Unreleased]
 
+- **[wrapper]** Fix `humanize=True` breaking interactions with elements **inside iframes** (#428). `frame.locator("#btn").click()` / `fill()` / `hover()` / etc. (and the frame-level `frame.click(...)` equivalents) now resolve the selector in the owning sub-frame's own document instead of misrouting to the top page, which previously raised `ElementNotAttachedError`. Humanized mouse motion is preserved inside iframes. Python only (the JS and .NET wrappers were already frame-correct).
+
 ## [0.4.8] — 2026-07-05
 
 - **[binary]** Chromium **148.0.7778.215.5** (Pro, Windows + Linux; macOS follows) — the biggest fingerprint update yet. Pro license required; v146 stays free.
