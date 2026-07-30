@@ -815,3 +815,38 @@ class TestBuildLaunchEnv:
         """Empty/whitespace key param treated as absent → None."""
         assert build_launch_env(license_key="") is None
         assert build_launch_env(license_key="   ") is None
+
+    def test_status_file_carried_on_inherit_path(self):
+        """status_file must reach the child even on an inherit-parent-env path.
+        Env source with no user_env would normally return None (inherit); with a
+        status_file it must become a full os.environ copy carrying both the key
+        and the status var (Playwright replaces, not merges)."""
+        from cloakbrowser.license import LICENSE_STATUS_FILE_ENV
+        with patch.dict(os.environ, {"CLOAKBROWSER_LICENSE_KEY": "cb_env"}):
+            result = build_launch_env(status_file="/tmp/denials/x.json")
+            assert result is not None
+            assert result[LICENSE_STATUS_FILE_ENV] == "/tmp/denials/x.json"
+            assert result["CLOAKBROWSER_LICENSE_KEY"] == "cb_env"
+            assert "HOME" in result  # seeded from parent env
+
+    def test_status_file_on_default_file_keeps_key_out_of_env(self, tmp_path):
+        """default_file source + status_file → the status var is injected but the
+        key stays out of the env (binary still reads the key file; HOME present)."""
+        from cloakbrowser.license import LICENSE_STATUS_FILE_ENV
+        home_dir = tmp_path / "home"
+        default_cache = home_dir / ".cloakbrowser"
+        default_cache.mkdir(parents=True)
+        (default_cache / "license.key").write_text("cb_file_key\n")
+        with patch.dict(os.environ, {"HOME": str(home_dir)}, clear=True), \
+             patch("cloakbrowser.license.get_cache_dir", return_value=default_cache), \
+             patch("pathlib.Path.home", return_value=home_dir):
+            result = build_launch_env(status_file="/tmp/denials/y.json")
+            assert result is not None
+            assert result[LICENSE_STATUS_FILE_ENV] == "/tmp/denials/y.json"
+            assert "CLOAKBROWSER_LICENSE_KEY" not in result
+            assert result["HOME"] == str(home_dir)
+
+    def test_no_status_file_unchanged(self):
+        """Omitting status_file preserves the original behavior exactly."""
+        with patch.dict(os.environ, {"CLOAKBROWSER_LICENSE_KEY": "cb_env"}):
+            assert build_launch_env() is None

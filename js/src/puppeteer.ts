@@ -17,7 +17,18 @@ import { maybeWarnWindowsFonts } from "./fonts.js";
 import { ensureBinary } from "./download.js";
 import { isSocksProxy, normalizeHttpStringUrl, parseProxyUrl, reconstructHttpUrl, resolveProxyConfig } from "./proxy.js";
 import { maybeResolveGeoip, resolveWebrtcArgs, appendWebrtcExitIp } from "./geoip.js";
-import { buildLaunchEnv, licenseErrorFrom } from "./license.js";
+import {
+  buildLaunchEnv,
+  installLicenseGuard,
+  installLicenseGuardFactory,
+  licenseErrorFrom,
+  mintDenialFile,
+  PERSISTENT_PAGE_NAV_METHODS_PUPPETEER,
+  resolveLicenseKey,
+} from "./license.js";
+
+// Puppeteer's context factory: current API + the deprecated incognito alias.
+const PUPPETEER_CONTEXT_FACTORIES = ["createBrowserContext", "createIncognitoBrowserContext"];
 import { seedWidevineHint } from "./widevine.js";
 
 export { CloakBrowserLicenseError } from "./license.js";
@@ -178,10 +189,12 @@ export async function launch(options: LaunchOptions = {}): Promise<Browser> {
   const proxyAuth = resolveProxy(options, args);
 
   // Resolve env for the browser process (license key injection, if needed).
+  const denialPath = resolveLicenseKey(options.licenseKey) ? mintDenialFile() : undefined;
   const { env: userEnv, ...restLaunchOptions } = options.launchOptions ?? {};
   const launchEnv = buildLaunchEnv(
     options.licenseKey,
     userEnv as Record<string, string | undefined> | undefined,
+    denialPath,
   );
   const envResult = launchEnv !== undefined ? { env: launchEnv } : {};
 
@@ -202,6 +215,14 @@ export async function launch(options: LaunchOptions = {}): Promise<Browser> {
     throw err;
   }
 
+  // Convert a post-handshake license denial into a clear error on first use.
+  // Installed before applyPostLaunch so it sits closest to the real call.
+  if (denialPath) {
+    installLicenseGuard(browser, denialPath, ["newPage"]);
+    // A user who creates their own context bypasses the browser-level guard, so
+    // guard the context factory and the pages it hands back.
+    installLicenseGuardFactory(browser, denialPath, PUPPETEER_CONTEXT_FACTORIES, ["newPage"]);
+  }
   await applyPostLaunch(browser, options, proxyAuth);
   return browser;
 }
@@ -234,10 +255,12 @@ export async function launchPersistentContext(
   seedWidevineHint(options.userDataDir, binaryPath);
 
   // Resolve env for the browser process (license key injection, if needed).
+  const denialPath = resolveLicenseKey(options.licenseKey) ? mintDenialFile() : undefined;
   const { env: userEnv, ...restLaunchOptions } = options.launchOptions ?? {};
   const launchEnv = buildLaunchEnv(
     options.licenseKey,
     userEnv as Record<string, string | undefined> | undefined,
+    denialPath,
   );
   const envResult = launchEnv !== undefined ? { env: launchEnv } : {};
 
@@ -259,6 +282,18 @@ export async function launchPersistentContext(
     throw err;
   }
 
+  // Guard newPage for a post-handshake denial (see launch()).
+  if (denialPath) {
+    installLicenseGuard(browser, denialPath, ["newPage"]);
+    // A persistent browser arrives with a page already open, so the user drives
+    // pages()[0] directly and never calls newPage. Guard the existing pages'
+    // navigation entry points too. Mirrors Python / Playwright wrapper.
+    for (const pg of await browser.pages()) {
+      installLicenseGuard(pg, denialPath, PERSISTENT_PAGE_NAV_METHODS_PUPPETEER);
+    }
+    // A user-created context bypasses the browser-level guard (see launch()).
+    installLicenseGuardFactory(browser, denialPath, PUPPETEER_CONTEXT_FACTORIES, ["newPage"]);
+  }
   await applyPostLaunch(browser, options, proxyAuth);
   return browser;
 }

@@ -117,6 +117,124 @@ public static class License
         return msg is not null ? new CloakBrowserLicenseError(msg, ex) : null;
     }
 
+    /// <summary>
+    /// Env var the wrapper uses to tell the Pro binary where to record a license
+    /// denial. A denial that resolves AFTER the CDP handshake (e.g. an over-cap
+    /// seat) kills the browser once the driver already holds a live connection,
+    /// so the exit code never reaches the wrapper as a launch failure. The binary
+    /// writes the code to this path just before exiting; the wrapper reads it when
+    /// the user's next call fails. Old binaries ignore the unknown var.
+    /// </summary>
+    public const string LicenseStatusFileEnv = "CLOAKBROWSER_LICENSE_STATUS_FILE";
+
+    /// <summary>
+    /// Maps a raw license exit code (76-79) to a <see cref="CloakBrowserLicenseError"/>,
+    /// or null for any code that is not a known license denial (so a genuine crash
+    /// is never mislabelled). Companion to <see cref="LicenseErrorMessage"/> for the
+    /// post-handshake file path where we hold the integer directly.
+    /// </summary>
+    public static CloakBrowserLicenseError? LicenseErrorForCode(int code)
+    {
+        return LicenseExitMessages.TryGetValue(code, out var msg)
+            ? new CloakBrowserLicenseError(msg)
+            : null;
+    }
+
+    /// <summary>
+    /// Reads and consumes a denial file written by the binary, returning its code.
+    /// The file holds a single JSON integer (the exit code). Reading is destructive:
+    /// the file is deleted afterwards so a later launch can't see a stale code. Any
+    /// problem — absent, unreadable, or not a valid int — yields null.
+    /// </summary>
+    // Once a denial has been observed for a per-launch path, remember it. The
+    // read is destructive, so a concurrent second guarded call for the same
+    // launch would otherwise find the file gone and miss the denial. Paths are
+    // unique per launch; ConcurrentDictionary since Tasks may run on the pool.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> ObservedDenials = new();
+
+    public static int? ReadDenialFile(string filePath)
+    {
+        if (ObservedDenials.TryGetValue(filePath, out var cached)) return cached;
+        int? code = null;
+        try
+        {
+            var raw = File.ReadAllText(filePath);
+            // Parse as tolerantly as Python (int(json.load)) and JS
+            // (Number(JSON.parse)): accept a bare JSON number AND a quoted or
+            // whitespace-padded value, so all three wrappers read an identical
+            // denial file the same way.
+            using var doc = JsonDocument.Parse(raw);
+            var el = doc.RootElement;
+            code = el.ValueKind switch
+            {
+                JsonValueKind.Number => el.GetInt32(),
+                JsonValueKind.String => int.Parse(
+                    el.GetString()!, System.Globalization.CultureInfo.InvariantCulture),
+                _ => throw new FormatException("denial file is not a number"),
+            };
+        }
+        catch
+        {
+            code = null;
+        }
+        try { File.Delete(filePath); } catch { /* best-effort cleanup */ }
+        if (code.HasValue)
+        {
+            ObservedDenials[filePath] = code.Value;
+            return code;
+        }
+        // File gone/garbage: a concurrent reader may have already recorded it.
+        return ObservedDenials.TryGetValue(filePath, out var c2) ? c2 : (int?)null;
+    }
+
+    /// <summary>
+    /// Returns a fresh, unique path for the binary to write a denial code to. Only
+    /// computes the path (and ensures the parent dir exists) — the file is created
+    /// by the binary, and only on a denial, so a granted launch leaves nothing
+    /// behind. Returns null if the directory can't be created; the caller then skips
+    /// the feature (the fix must never break a launch).
+    /// </summary>
+    public static string? MintDenialFile()
+    {
+        try
+        {
+            var home = HomeDirOverride?.Invoke()
+                ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            var denialDir = Path.Combine(home, ".cloakbrowser", "denials");
+            Directory.CreateDirectory(denialDir);
+            SweepStaleDenials(denialDir);
+            return Path.Combine(denialDir, $"{Guid.NewGuid():N}.json");
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    // A denial file is orphaned when the binary writes one but the user never
+    // calls a guarded method afterwards. It is only consumed on a guarded call,
+    // so sweep leftovers older than this at mint time — long enough that a live
+    // in-flight denial from a concurrent launch is never deleted before its
+    // owner reads it.
+    private static readonly TimeSpan DenialFileTtl = TimeSpan.FromHours(1);
+
+    private static void SweepStaleDenials(string denialDir)
+    {
+        try
+        {
+            var cutoff = DateTime.UtcNow - DenialFileTtl;
+            foreach (var f in Directory.EnumerateFiles(denialDir, "*.json"))
+            {
+                try
+                {
+                    if (File.GetLastWriteTimeUtc(f) < cutoff) File.Delete(f);
+                }
+                catch { /* best-effort */ }
+            }
+        }
+        catch { /* best-effort */ }
+    }
+
     // -----------------------------------------------------------------------
     // Testing seams - mirror the monkey-patching the Python/JS tests rely on.
     // Null means "use real behavior" (HTTP). Tests inject deterministic results
@@ -218,7 +336,30 @@ public static class License
     /// </summary>
     public static Dictionary<string, string>? BuildLaunchEnv(
         string? licenseKey = null,
-        Dictionary<string, string>? userEnv = null)
+        Dictionary<string, string>? userEnv = null,
+        string? statusFile = null)
+    {
+        var result = BuildKeyEnv(licenseKey, userEnv);
+
+        // Add the denial-status file path last so it rides along even on the
+        // inherit-parent-env (null) paths, which then have to become a full
+        // parent-env copy (Playwright replaces, not merges). Only set when the
+        // caller asked for it, which it only does when a license key is in play.
+        if (statusFile != null)
+        {
+            result ??= Environment.GetEnvironmentVariables()
+                .Cast<System.Collections.DictionaryEntry>()
+                .ToDictionary(e => (string)e.Key, e => (string)e.Value!);
+            result[LicenseStatusFileEnv] = statusFile;
+        }
+
+        return result;
+    }
+
+    /// <summary>The license-key half of BuildLaunchEnv (unchanged behavior).</summary>
+    private static Dictionary<string, string>? BuildKeyEnv(
+        string? licenseKey,
+        Dictionary<string, string>? userEnv)
     {
         var (key, source) = ResolveLicenseKeyWithSource(licenseKey);
 

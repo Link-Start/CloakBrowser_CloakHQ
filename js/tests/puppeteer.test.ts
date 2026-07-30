@@ -29,6 +29,9 @@ describe("puppeteer launch", () => {
       newPage: vi.fn().mockResolvedValue({
         authenticate: vi.fn(),
       }),
+      // A real persistent Puppeteer browser arrives with an initial page; the
+      // license guard iterates browser.pages() to guard the pre-open page's nav.
+      pages: vi.fn().mockResolvedValue([]),
       close: vi.fn(),
     };
     vi.mocked(puppeteerMock.default.launch).mockResolvedValue(mockBrowser);
@@ -276,6 +279,9 @@ describe("puppeteer launchPersistentContext", () => {
       newPage: vi.fn().mockResolvedValue({
         authenticate: vi.fn(),
       }),
+      // A real persistent Puppeteer browser arrives with an initial page; the
+      // license guard iterates browser.pages() to guard the pre-open page's nav.
+      pages: vi.fn().mockResolvedValue([]),
       close: vi.fn(),
     };
     vi.mocked(puppeteerMock.default.launch).mockResolvedValue(mockBrowser);

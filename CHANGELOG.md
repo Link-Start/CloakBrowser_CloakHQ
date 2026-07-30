@@ -6,6 +6,12 @@ Changes are tagged: **[wrapper]** for Python/JS wrapper, **[binary]** for Chromi
 
 ---
 
+## [Unreleased]
+
+- **[wrapper]** A concurrent-session limit that is reached *after* the browser has already connected now surfaces as a clear `CloakBrowserLicenseError` on your first page action, instead of a generic "target closed" error (#477). It covers the persistent-context flow, where the first page is already open, as well as pages created from your own browser contexts. Python, JavaScript (Playwright + Puppeteer), and .NET.
+
+---
+
 ## [0.5.3] — 2026-07-30
 
 - **[wrapper]** When the Windows font-metrics profile is requested, the launch feature set now matches a stock Chrome install rather than Playwright's test-harness defaults, which switch off a feature stock Chrome ships enabled. Merged into any `--enable-features` value you pass instead of adding a second flag. Python, JavaScript, and .NET.

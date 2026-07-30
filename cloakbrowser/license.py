@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -116,6 +117,103 @@ def license_error_message(error_text: str) -> str | None:
     return _LICENSE_EXIT_MESSAGES.get(exit_code)
 
 
+# Env var the wrapper uses to tell the Pro binary where to record a license
+# denial. A denial that resolves AFTER the CDP handshake (e.g. an over-cap seat)
+# exits the browser once Playwright already holds a live connection, so the exit
+# code never reaches the wrapper as a launch failure. The binary writes the code
+# to this path just before exiting; the wrapper reads it when the user's next
+# call fails. Old binaries ignore the unknown var and never write — so a missing
+# file just means "behave as before".
+LICENSE_STATUS_FILE_ENV = "CLOAKBROWSER_LICENSE_STATUS_FILE"
+
+
+def license_error_for_code(code: int) -> CloakBrowserLicenseError | None:
+    """Map a raw license exit code (76-79) to a CloakBrowserLicenseError.
+
+    Returns None for any code that is not a known license denial, so a genuine
+    crash is never mislabelled. Companion to ``license_error_message`` (which
+    parses the code out of a launch-failure string); this takes the integer
+    directly, for the post-handshake file-based path.
+    """
+    msg = _LICENSE_EXIT_MESSAGES.get(code)
+    return CloakBrowserLicenseError(msg) if msg is not None else None
+
+
+# Once a denial has been observed for a per-launch path, remember it. The read
+# is destructive, so a second guarded call for the same launch (e.g. concurrent
+# new_page + goto on a denied browser) would otherwise find the file already
+# gone and miss the denial. Paths are unique per launch (uuid), so entries never
+# collide across launches.
+_OBSERVED_DENIALS: dict[str, int] = {}
+
+
+def read_denial_file(path: str) -> int | None:
+    """Read and consume a denial file written by the binary, returning its code.
+
+    The file holds a single JSON integer (the license exit code). Reading is
+    destructive: the file is unlinked afterwards so a later launch can't see a
+    stale code, but the observed code is cached in-process so a concurrent
+    second guarded call still surfaces the denial. Any problem — file absent,
+    unreadable, or not a valid int — yields None, meaning "no license signal,
+    treat as an ordinary error".
+    """
+    cached = _OBSERVED_DENIALS.get(path)
+    if cached is not None:
+        return cached
+    try:
+        with open(path, encoding="utf-8") as fh:
+            code = int(json.load(fh))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    _OBSERVED_DENIALS[path] = code
+    return code
+
+
+# A denial file is orphaned when the binary writes one but the user never calls
+# a guarded method afterwards (e.g. just closes the browser). It is only ever
+# consumed on a guarded call, so nothing else would remove it. Sweep leftovers
+# older than this at mint time — long enough that a live in-flight denial from a
+# concurrent launch is never deleted before its owner reads it.
+_DENIAL_FILE_TTL_SECONDS = 3600
+
+
+def _sweep_stale_denials(denial_dir: Path) -> None:
+    """Best-effort removal of denial files older than the TTL. Never raises."""
+    try:
+        now = time.time()
+        for f in denial_dir.glob("*.json"):
+            try:
+                if now - f.stat().st_mtime > _DENIAL_FILE_TTL_SECONDS:
+                    f.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def mint_denial_file() -> str | None:
+    """Return a fresh, unique path for the binary to write a denial code to.
+
+    Only computes the path (and ensures the parent dir exists) — the file is
+    created by the binary, and only on a denial, so a granted launch leaves
+    nothing behind. Returns None if the directory can't be created (e.g.
+    ``~/.cloakbrowser`` not writable), in which case the caller simply skips the
+    feature; the fix must never break a launch.
+    """
+    try:
+        denial_dir = Path.home() / ".cloakbrowser" / "denials"
+        denial_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    _sweep_stale_denials(denial_dir)
+    return str(denial_dir / f"{uuid.uuid4().hex}.json")
+
+
 _LICENSE_KEY_SOURCE_PARAM = "param"
 _LICENSE_KEY_SOURCE_ENV = "env"
 _LICENSE_KEY_SOURCE_DEFAULT_FILE = "default_file"
@@ -169,6 +267,7 @@ def resolve_license_key(license_key: str | None = None) -> str | None:
 def build_launch_env(
     license_key: str | None = None,
     user_env: Mapping[str, str | None] | None = None,
+    status_file: str | None = None,
 ) -> dict[str, str] | None:
     """Build child process env dict with any needed license key injection.
 
@@ -191,6 +290,11 @@ def build_launch_env(
     Playwright kwargs), it is used as the base instead of ``os.environ``,
     and the key is injected only when needed.
 
+    When *status_file* is given, the denial-file path (see
+    ``LICENSE_STATUS_FILE_ENV``) is added to the child env on every path — even
+    the "inherit parent env" ones, which then have to become a full
+    ``os.environ`` copy because Playwright *replaces* rather than merges the env.
+
     Returns ``None`` when no injection is needed and no custom user_env was
     given — Playwright treats ``env=None`` as "inherit parent env", which
     is correct in those cases.
@@ -205,6 +309,23 @@ def build_launch_env(
         else None
     )
 
+    result = _build_key_env(key, source, base_env)
+
+    # Add the denial-status file path last so it rides along even on the
+    # inherit-parent-env (result is None) paths. Only set when a caller asked
+    # for it, which it only does when a license key is in play.
+    if status_file is not None:
+        if result is None:
+            result = dict(os.environ)
+        result[LICENSE_STATUS_FILE_ENV] = status_file
+
+    return result
+
+
+def _build_key_env(
+    key: str | None, source: str, base_env: dict[str, str] | None
+) -> dict[str, str] | None:
+    """The license-key half of build_launch_env (unchanged behavior)."""
     # Default file: binary reads it directly — no env injection needed,
     # UNLESS the caller passes a custom env. Playwright replaces (not merges)
     # the child env, which can drop HOME and hide the file from the binary,

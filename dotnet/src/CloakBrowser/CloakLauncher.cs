@@ -43,6 +43,13 @@ public static class CloakLauncher
 
         CloakLog.Debug($"Launching stealth Chromium (headless={options.Headless}, args={chromeArgs.Count})");
 
+        // Per-launch denial file: the binary records a post-handshake license
+        // denial here so NewPage/NewContext can surface it (see LicenseGuard).
+        // Only when a key is in play — keyless runs the unenforced free binary.
+        var denialPath = License.ResolveLicenseKey(options.LicenseKey) != null
+            ? License.MintDenialFile()
+            : null;
+
         var playwright = await Playwright.CreateAsync().ConfigureAwait(false);
         // Only the launch is wrapped for license-error mapping (mirrors Python/JS).
         IBrowser browser;
@@ -55,7 +62,7 @@ public static class CloakLauncher
                 Args = chromeArgs,
                 IgnoreDefaultArgs = Config.IgnoreDefaultArgs,
                 Proxy = proxyResolution.PlaywrightProxy,
-                Env = License.BuildLaunchEnv(options.LicenseKey),
+                Env = License.BuildLaunchEnv(options.LicenseKey, statusFile: denialPath),
             }).ConfigureAwait(false);
         }
         catch (Exception ex)
@@ -79,7 +86,7 @@ public static class CloakLauncher
             bool headlessNoViewport = Config.BinarySupportsHeadlessNoViewport(
                 options.LicenseKey, options.BrowserVersion, options.ReleaseChannel);
             return new CloakBrowserHandle(
-                playwright, browser, options.Humanize, humanCfg, options.Headless, headlessNoViewport);
+                playwright, browser, options.Humanize, humanCfg, options.Headless, headlessNoViewport, denialPath);
         }
         catch
         {
@@ -127,7 +134,11 @@ public static class CloakLauncher
         try
         {
             var ctxOptions = BuildContextOptions(options);
-            var context = await browserHandle.Browser.NewContextAsync(ctxOptions).ConfigureAwait(false);
+            // Guard the internal context creation too (mirrors Python, where
+            // browser.new_context is the guarded method), then guard the context's
+            // pages via the handle below — both share the browser's denial path.
+            var context = await LicenseGuard.GuardAsync(
+                () => browserHandle.Browser.NewContextAsync(ctxOptions), browserHandle.DenialPath).ConfigureAwait(false);
 
             var humanCfg = options.Humanize
                 ? HumanConfigFactory.Resolve(options.HumanPreset, options.HumanConfig)
@@ -135,7 +146,8 @@ public static class CloakLauncher
 
             // The context handle owns the browser; reuse the same Playwright instance.
             return new CloakContextHandle(
-                GetPlaywright(browserHandle), browserHandle.Browser, context, options.Humanize, humanCfg);
+                GetPlaywright(browserHandle), browserHandle.Browser, context, options.Humanize, humanCfg,
+                browserHandle.DenialPath);
         }
         catch
         {
@@ -177,6 +189,10 @@ public static class CloakLauncher
         // Seed the Widevine CDM hint (Linux-only; no-op elsewhere).
         Widevine.SeedWidevineHint(userDataDir, binaryPath);
 
+        var denialPath = License.ResolveLicenseKey(options.LicenseKey) != null
+            ? License.MintDenialFile()
+            : null;
+
         var playwright = await Playwright.CreateAsync().ConfigureAwait(false);
         // Only the launch is wrapped for license-error mapping (mirrors Python/JS).
         IBrowserContext context;
@@ -189,7 +205,7 @@ public static class CloakLauncher
                 Args = chromeArgs,
                 IgnoreDefaultArgs = Config.IgnoreDefaultArgs,
                 Proxy = proxyResolution.PlaywrightProxy,
-                Env = License.BuildLaunchEnv(options.LicenseKey),
+                Env = License.BuildLaunchEnv(options.LicenseKey, statusFile: denialPath),
             };
             ApplyContextEmulation(ctxLaunchOptions, options);
 
@@ -211,7 +227,7 @@ public static class CloakLauncher
             var humanCfg = options.Humanize
                 ? HumanConfigFactory.Resolve(options.HumanPreset, options.HumanConfig)
                 : null;
-            return new CloakContextHandle(playwright, null, context, options.Humanize, humanCfg);
+            return new CloakContextHandle(playwright, null, context, options.Humanize, humanCfg, denialPath);
         }
         catch
         {

@@ -943,4 +943,146 @@ public class LicenseTests : IDisposable
         Assert.Contains("invalid", lic!.Message);
         Assert.Null(License.LicenseErrorFrom(new Exception("some unrelated crash")));
     }
+
+    // ── post-handshake denial: helpers + guard ────────────
+
+    [Theory]
+    [InlineData(76, "session limit")]
+    [InlineData(77, "invalid, expired, or missing")]
+    [InlineData(78, "couldn't verify")]
+    [InlineData(79, "not writable")]
+    public void LicenseErrorForCode_MapsKnownCodes(int code, string fragment)
+    {
+        var err = License.LicenseErrorForCode(code);
+        Assert.NotNull(err);
+        Assert.Contains(fragment, err!.Message);
+    }
+
+    [Fact]
+    public void LicenseErrorForCode_UnknownReturnsNull()
+    {
+        Assert.Null(License.LicenseErrorForCode(1));
+        Assert.Null(License.LicenseErrorForCode(0));
+    }
+
+    [Fact]
+    public void ReadDenialFile_ReturnsCodeAndConsumes()
+    {
+        var f = Path.Combine(_tmp, "d.json");
+        File.WriteAllText(f, "76");
+        Assert.Equal(76, License.ReadDenialFile(f));
+        Assert.False(File.Exists(f)); // consumed so a later launch sees no stale code
+    }
+
+    [Fact]
+    public void ReadDenialFile_SecondReadStillReturnsCodeAfterConsumed()
+    {
+        var f = Path.Combine(_tmp, "cached.json");
+        File.WriteAllText(f, "76");
+        Assert.Equal(76, License.ReadDenialFile(f));
+        Assert.False(File.Exists(f));            // consumed
+        Assert.Equal(76, License.ReadDenialFile(f)); // file gone, cached in-process
+    }
+
+    [Fact]
+    public void ReadDenialFile_MissingOrGarbageReturnsNull()
+    {
+        Assert.Null(License.ReadDenialFile(Path.Combine(_tmp, "nope.json")));
+        var bad = Path.Combine(_tmp, "bad.json");
+        File.WriteAllText(bad, "not-json");
+        Assert.Null(License.ReadDenialFile(bad));
+        Assert.False(File.Exists(bad)); // garbage is still cleaned up
+    }
+
+    [Theory]
+    [InlineData("76")]        // bare int
+    [InlineData("\"76\"")]    // quoted (Python/JS accept it -> .NET must too)
+    [InlineData(" 76 ")]      // whitespace-padded
+    [InlineData("76\n")]      // trailing newline
+    public void ReadDenialFile_ParsesTolerantlyLikePythonAndJs(string content)
+    {
+        var f = Path.Combine(_tmp, "d.json");
+        File.WriteAllText(f, content);
+        Assert.Equal(76, License.ReadDenialFile(f));
+    }
+
+    [Fact]
+    public void MintDenialFile_ReturnsPathUnderDenialsDir()
+    {
+        License.HomeDirOverride = () => _tmp;
+        try
+        {
+            var path = License.MintDenialFile();
+            Assert.NotNull(path);
+            Assert.EndsWith(".json", path);
+            Assert.Contains("denials", path);
+            Assert.True(Directory.Exists(Path.Combine(_tmp, ".cloakbrowser", "denials")));
+        }
+        finally { License.HomeDirOverride = null; }
+    }
+
+    [Fact]
+    public void MintDenialFile_SweepsStaleFilesKeepsFresh()
+    {
+        License.HomeDirOverride = () => _tmp;
+        try
+        {
+            var denials = Path.Combine(_tmp, ".cloakbrowser", "denials");
+            Directory.CreateDirectory(denials);
+            var stale = Path.Combine(denials, "stale.json");
+            File.WriteAllText(stale, "76");
+            File.SetLastWriteTimeUtc(stale, DateTime.UtcNow - TimeSpan.FromHours(2));
+            var fresh = Path.Combine(denials, "fresh.json"); // a concurrent live denial
+            File.WriteAllText(fresh, "76");
+
+            License.MintDenialFile();
+
+            Assert.False(File.Exists(stale)); // orphan swept
+            Assert.True(File.Exists(fresh));  // in-flight denial untouched
+        }
+        finally { License.HomeDirOverride = null; }
+    }
+
+    [Fact]
+    public void BuildLaunchEnv_StatusFileCarriedOnInheritPath()
+    {
+        var prev = Environment.GetEnvironmentVariable("CLOAKBROWSER_LICENSE_KEY");
+        try
+        {
+            Environment.SetEnvironmentVariable("CLOAKBROWSER_LICENSE_KEY", "cb_env");
+            var result = License.BuildLaunchEnv(statusFile: "/tmp/denials/x.json");
+            Assert.NotNull(result);
+            Assert.Equal("/tmp/denials/x.json", result![License.LicenseStatusFileEnv]);
+            Assert.Equal("cb_env", result["CLOAKBROWSER_LICENSE_KEY"]);
+        }
+        finally { Environment.SetEnvironmentVariable("CLOAKBROWSER_LICENSE_KEY", prev); }
+    }
+
+    [Fact]
+    public async Task LicenseGuard_RaisesLicenseErrorWhenDenialFilePresent()
+    {
+        var f = Path.Combine(_tmp, "d.json");
+        File.WriteAllText(f, "76");
+        await Assert.ThrowsAsync<CloakBrowserLicenseError>(() =>
+            LicenseGuard.GuardAsync<object>(
+                () => throw new Exception("Target page, context or browser has been closed"), f));
+    }
+
+    [Fact]
+    public async Task LicenseGuard_PassesThroughWhenNoFile()
+    {
+        var original = new InvalidOperationException("real crash");
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            LicenseGuard.GuardAsync<object>(() => throw original, Path.Combine(_tmp, "absent.json")));
+        Assert.Same(original, thrown);
+    }
+
+    [Fact]
+    public async Task LicenseGuard_NullPathPassesThrough()
+    {
+        var original = new InvalidOperationException("real crash");
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            LicenseGuard.GuardAsync<object>(() => throw original, null));
+        Assert.Same(original, thrown);
+    }
 }

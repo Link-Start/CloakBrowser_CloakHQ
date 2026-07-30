@@ -13,6 +13,14 @@ import {
   buildLaunchEnv,
   licenseErrorMessage,
   licenseErrorFrom,
+  licenseErrorForCode,
+  readDenialFile,
+  mintDenialFile,
+  installLicenseGuard,
+  installLicenseGuardFactory,
+  PERSISTENT_PAGE_NAV_METHODS,
+  PERSISTENT_PAGE_NAV_METHODS_PUPPETEER,
+  LICENSE_STATUS_FILE_ENV,
   CloakBrowserLicenseError,
 } from "../src/license.js";
 
@@ -572,6 +580,210 @@ describe("buildLaunchEnv", () => {
   it("empty licenseKey treated as missing", () => {
     expect(buildLaunchEnv("")).toBeUndefined();
     expect(buildLaunchEnv("   ")).toBeUndefined();
+  });
+
+  it("statusFile is carried on an inherit-parent-env path", () => {
+    const prev = process.env.CLOAKBROWSER_LICENSE_KEY;
+    process.env.CLOAKBROWSER_LICENSE_KEY = "cb_env";
+    try {
+      const result = buildLaunchEnv(undefined, undefined, "/tmp/denials/x.json");
+      expect(result).toBeDefined();
+      expect(result![LICENSE_STATUS_FILE_ENV]).toBe("/tmp/denials/x.json");
+      expect(result!.CLOAKBROWSER_LICENSE_KEY).toBe("cb_env");
+    } finally {
+      if (prev === undefined) delete process.env.CLOAKBROWSER_LICENSE_KEY;
+      else process.env.CLOAKBROWSER_LICENSE_KEY = prev;
+    }
+  });
+
+  it("omitting statusFile preserves original behavior", () => {
+    const prev = process.env.CLOAKBROWSER_LICENSE_KEY;
+    process.env.CLOAKBROWSER_LICENSE_KEY = "cb_env";
+    try {
+      expect(buildLaunchEnv()).toBeUndefined();
+    } finally {
+      if (prev === undefined) delete process.env.CLOAKBROWSER_LICENSE_KEY;
+      else process.env.CLOAKBROWSER_LICENSE_KEY = prev;
+    }
+  });
+});
+
+// ── post-handshake denial: helpers + guard ─────────────
+describe("denial file + license guard", () => {
+  let tmpDir: string;
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cloak-denial-"));
+  });
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it.each([
+    [76, "session limit"],
+    [77, "invalid, expired, or missing"],
+    [78, "couldn't verify"],
+    [79, "not writable"],
+  ])("licenseErrorForCode maps %i", (code, fragment) => {
+    const err = licenseErrorForCode(code as number);
+    expect(err).toBeInstanceOf(CloakBrowserLicenseError);
+    expect(err!.message).toContain(fragment as string);
+  });
+
+  it("licenseErrorForCode returns null for an unknown code", () => {
+    expect(licenseErrorForCode(1)).toBeNull();
+    expect(licenseErrorForCode(0)).toBeNull();
+  });
+
+  it("readDenialFile returns the code and consumes the file", () => {
+    const f = path.join(tmpDir, "d.json");
+    fs.writeFileSync(f, "76");
+    expect(readDenialFile(f)).toBe(76);
+    expect(fs.existsSync(f)).toBe(false);
+  });
+
+  it("readDenialFile still returns the code on a second read after it was consumed", () => {
+    const f = path.join(tmpDir, "d.json");
+    fs.writeFileSync(f, "76");
+    expect(readDenialFile(f)).toBe(76);
+    expect(fs.existsSync(f)).toBe(false);   // consumed
+    expect(readDenialFile(f)).toBe(76);     // file gone, cached in-process
+  });
+
+  it("readDenialFile returns null for missing/garbage", () => {
+    expect(readDenialFile(path.join(tmpDir, "nope.json"))).toBeNull();
+    const bad = path.join(tmpDir, "bad.json");
+    fs.writeFileSync(bad, "not-json");
+    expect(readDenialFile(bad)).toBeNull();
+    expect(fs.existsSync(bad)).toBe(false);
+  });
+
+  it("mintDenialFile returns a path under a denials dir", () => {
+    const spy = vi.spyOn(os, "homedir").mockReturnValue(tmpDir);
+    try {
+      const p = mintDenialFile();
+      expect(p).toBeDefined();
+      expect(p!.endsWith(".json")).toBe(true);
+      expect(p).toContain("denials");
+      expect(fs.existsSync(path.join(tmpDir, ".cloakbrowser", "denials"))).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("mintDenialFile sweeps stale denial files but keeps fresh ones", () => {
+    const spy = vi.spyOn(os, "homedir").mockReturnValue(tmpDir);
+    try {
+      const denials = path.join(tmpDir, ".cloakbrowser", "denials");
+      fs.mkdirSync(denials, { recursive: true });
+      const stale = path.join(denials, "stale.json");
+      fs.writeFileSync(stale, "76");
+      const old = Date.now() / 1000 - 7200; // 2h ago (seconds for utimesSync)
+      fs.utimesSync(stale, old, old);
+      const fresh = path.join(denials, "fresh.json"); // a concurrent live denial
+      fs.writeFileSync(fresh, "76");
+
+      mintDenialFile();
+
+      expect(fs.existsSync(stale)).toBe(false); // orphan swept
+      expect(fs.existsSync(fresh)).toBe(true);  // in-flight denial untouched
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("guard raises CloakBrowserLicenseError when the denial file is present", async () => {
+    const f = path.join(tmpDir, "d.json");
+    fs.writeFileSync(f, "76");
+    const target: any = {
+      newPage: async () => { throw new Error("Target page, context or browser has been closed"); },
+    };
+    installLicenseGuard(target, f, ["newPage"]);
+    await expect(target.newPage()).rejects.toThrow(CloakBrowserLicenseError);
+  });
+
+  it("guard passes the original error through when there is no file", async () => {
+    const original = new Error("real crash");
+    const target: any = { newPage: async () => { throw original; } };
+    installLicenseGuard(target, path.join(tmpDir, "absent.json"), ["newPage"]);
+    await expect(target.newPage()).rejects.toBe(original);
+  });
+
+  it("guard passes through when the file is garbage", async () => {
+    const f = path.join(tmpDir, "bad.json");
+    fs.writeFileSync(f, "garbage");
+    const original = new Error("real crash");
+    const target: any = { newPage: async () => { throw original; } };
+    installLicenseGuard(target, f, ["newPage"]);
+    await expect(target.newPage()).rejects.toBe(original);
+  });
+
+  // A persistent context arrives with pages()[0] already open, so the user
+  // navigates that page directly and never calls newPage. The pre-open page's
+  // navigation entry points must surface the denial too.
+  it("PERSISTENT_PAGE_NAV_METHODS covers goto + the wait family (Playwright)", () => {
+    expect(PERSISTENT_PAGE_NAV_METHODS).toEqual([
+      "goto", "reload", "waitForLoadState", "waitForURL", "waitForSelector",
+    ]);
+  });
+
+  it("PERSISTENT_PAGE_NAV_METHODS_PUPPETEER uses Puppeteer's method names", () => {
+    expect(PERSISTENT_PAGE_NAV_METHODS_PUPPETEER).toEqual([
+      "goto", "reload", "waitForNavigation", "waitForSelector",
+    ]);
+  });
+
+  it.each([...PERSISTENT_PAGE_NAV_METHODS])(
+    "guard surfaces the denial on a pre-open page's %s()",
+    async (method) => {
+      const f = path.join(tmpDir, "d.json");
+      fs.writeFileSync(f, "76");
+      const page: any = {};
+      for (const m of PERSISTENT_PAGE_NAV_METHODS) {
+        page[m] = async () => { throw new Error("Target page, context or browser has been closed"); };
+      }
+      installLicenseGuard(page, f, PERSISTENT_PAGE_NAV_METHODS);
+      await expect(page[method]()).rejects.toThrow(CloakBrowserLicenseError);
+    },
+  );
+
+  it("pre-open page guard passes a genuine failure through untouched", async () => {
+    const original = new Error("real crash");
+    const page: any = { goto: async () => { throw original; } };
+    installLicenseGuard(page, path.join(tmpDir, "absent.json"), PERSISTENT_PAGE_NAV_METHODS);
+    await expect(page.goto()).rejects.toBe(original);
+  });
+
+  // A user who creates their own context (Puppeteer createBrowserContext)
+  // bypasses the browser-level guard; the factory guard covers that path.
+  it("factory guard guards newPage on a context it hands back", async () => {
+    const f = path.join(tmpDir, "d.json");
+    fs.writeFileSync(f, "76");
+    const ctx: any = {
+      newPage: async () => { throw new Error("Target page, context or browser has been closed"); },
+    };
+    const browser: any = { createBrowserContext: async () => ctx };
+    installLicenseGuardFactory(browser, f, ["createBrowserContext"], ["newPage"]);
+    const created = await browser.createBrowserContext();
+    await expect(created.newPage()).rejects.toThrow(CloakBrowserLicenseError);
+  });
+
+  it("factory guard surfaces a denial thrown during context creation", async () => {
+    const f = path.join(tmpDir, "d.json");
+    fs.writeFileSync(f, "76");
+    const browser: any = {
+      createBrowserContext: async () => { throw new Error("Target page, context or browser has been closed"); },
+    };
+    installLicenseGuardFactory(browser, f, ["createBrowserContext"], ["newPage"]);
+    await expect(browser.createBrowserContext()).rejects.toThrow(CloakBrowserLicenseError);
+  });
+
+  it("factory guard skips a missing factory method and passes creation errors through", async () => {
+    const original = new Error("real crash");
+    const browser: any = { createBrowserContext: async () => { throw original; } };
+    // createIncognitoBrowserContext is absent -> skipped, no throw at install time
+    installLicenseGuardFactory(browser, path.join(tmpDir, "absent.json"),
+      ["createBrowserContext", "createIncognitoBrowserContext"], ["newPage"]);
+    await expect(browser.createBrowserContext()).rejects.toBe(original);
   });
 });
 

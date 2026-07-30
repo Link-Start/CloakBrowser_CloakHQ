@@ -15,7 +15,14 @@ import { maybeWarnWindowsFonts } from "./fonts.js";
 import { ensureBinary } from "./download.js";
 import { resolveProxyConfig } from "./proxy.js";
 import { maybeResolveGeoip, resolveWebrtcArgs, appendWebrtcExitIp } from "./geoip.js";
-import { buildLaunchEnv, licenseErrorFrom } from "./license.js";
+import {
+  buildLaunchEnv,
+  installLicenseGuard,
+  licenseErrorFrom,
+  mintDenialFile,
+  PERSISTENT_PAGE_NAV_METHODS,
+  resolveLicenseKey,
+} from "./license.js";
 import { seedWidevineHint } from "./widevine.js";
 
 /** @internal Accept both timezone and timezoneId — either works, no warning. Exported for testing. */
@@ -112,7 +119,8 @@ export function buildContextOptions(
  * wrapper that needs to call `chromium.launch()` itself.
  */
 export async function buildLaunchOptions(
-  options: LaunchOptions = {}
+  options: LaunchOptions = {},
+  statusFile?: string,
 ): Promise<PlaywrightLaunchOptions> {
   const binaryPath =
     process.env.CLOAKBROWSER_BINARY_PATH ||
@@ -138,6 +146,7 @@ export async function buildLaunchOptions(
   const launchEnv = buildLaunchEnv(
     options.licenseKey,
     userEnv as Record<string, string | undefined> | undefined,
+    statusFile,
   );
   const envResult = launchEnv !== undefined ? { env: launchEnv } : {};
 
@@ -185,13 +194,21 @@ export async function humanizeBrowser(
  */
 export async function launch(options: LaunchOptions = {}): Promise<Browser> {
   const { chromium } = await import("playwright-core");
+  const denialPath = resolveLicenseKey(options.licenseKey) ? mintDenialFile() : undefined;
   let browser: Browser;
   try {
-    browser = await chromium.launch(await buildLaunchOptions(options));
+    browser = await chromium.launch(await buildLaunchOptions(options, denialPath));
   } catch (err) {
     const lic = licenseErrorFrom(err);
     if (lic) throw lic;
     throw err;
+  }
+  // Convert a post-handshake license denial into a clear error on first use.
+  // Installed before the wraps below so it sits closest to the real call. Stash
+  // the path so launchContext() can guard its context too. Mirrors Python launch().
+  if (denialPath) {
+    (browser as any).__cloakDenialPath = denialPath;
+    installLicenseGuard(browser, denialPath, ["newPage", "newContext"]);
   }
   // Headed: a bare browser.newPage() would inherit Playwright's emulated 1280x720
   // viewport -> outerWidth < innerWidth (impossible window = bot tell). Default
@@ -275,6 +292,13 @@ export async function launchContext(
     await browser.close();
   };
 
+  // browser.newContext above is already guarded by launch(); also guard the
+  // context's newPage for a denial that lands after the context is created.
+  const denialPath = (browser as any).__cloakDenialPath as string | undefined;
+  if (denialPath) {
+    installLicenseGuard(context, denialPath, ["newPage"]);
+  }
+
   // Human-like behavioral patching
   if (options.humanize) {
     const { patchContext } = await import('./human/index.js');
@@ -338,10 +362,12 @@ export async function launchPersistentContext(
   seedWidevineHint(options.userDataDir, binaryPath);
 
   // Resolve env for the browser process (license key injection, if needed).
+  const denialPath = resolveLicenseKey(options.licenseKey) ? mintDenialFile() : undefined;
   const { env: userEnv, ...restLaunchOptions } = options.launchOptions ?? {};
   const launchEnv = buildLaunchEnv(
     options.licenseKey,
     userEnv as Record<string, string | undefined> | undefined,
+    denialPath,
   );
   const envResult = launchEnv !== undefined ? { env: launchEnv } : {};
 
@@ -363,6 +389,18 @@ export async function launchPersistentContext(
     const lic = licenseErrorFrom(err);
     if (lic) throw lic;
     throw err;
+  }
+
+  // The persistent path hands back a context, so guard its newPage (see launch()).
+  if (denialPath) {
+    installLicenseGuard(context, denialPath, ["newPage"]);
+    // A persistent context arrives with a page already open, so the user
+    // navigates pages()[0] directly and never calls newPage. Guard the existing
+    // pages' navigation entry points too, or a post-handshake denial surfaces as
+    // a bare TargetClosedError on that first navigation. Mirrors Python.
+    for (const pg of context.pages()) {
+      installLicenseGuard(pg, denialPath, PERSISTENT_PAGE_NAV_METHODS);
+    }
   }
 
   // Human-like behavioral patching

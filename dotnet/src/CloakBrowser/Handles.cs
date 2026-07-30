@@ -16,6 +16,7 @@ public sealed class CloakBrowserHandle : IAsyncDisposable
     private readonly IBrowser _rawBrowser;
     private readonly bool _headless;
     private readonly bool _headlessNoViewport;
+    private readonly string? _denialPath;
 
     /// <summary>
     /// The Playwright browser. When humanize is enabled this is a transparent
@@ -32,8 +33,11 @@ public sealed class CloakBrowserHandle : IAsyncDisposable
     /// <summary>The owning Playwright instance (used internally to transfer ownership to a context handle).</summary>
     internal IPlaywright PlaywrightInstance => _playwright;
 
+    /// <summary>The per-launch denial-file path (used internally to guard a context handle's pages too).</summary>
+    internal string? DenialPath => _denialPath;
+
     internal CloakBrowserHandle(IPlaywright playwright, IBrowser browser, bool humanize, HumanConfig? humanCfg,
-        bool headless = true, bool headlessNoViewport = false)
+        bool headless = true, bool headlessNoViewport = false, string? denialPath = null)
     {
         _playwright = playwright;
         _rawBrowser = browser;
@@ -41,6 +45,7 @@ public sealed class CloakBrowserHandle : IAsyncDisposable
         _humanCfg = humanCfg;
         _headless = headless;
         _headlessNoViewport = headlessNoViewport;
+        _denialPath = denialPath;
         // Wrap the whole browser so the entire object graph (contexts, pages, mice,
         // keyboards, locators, frames) is humanized transparently. The wrapper is
         // headless-aware so the headed no-viewport default also applies when pages are
@@ -69,7 +74,7 @@ public sealed class CloakBrowserHandle : IAsyncDisposable
     /// <see cref="NewPageAsync"/>).
     /// </summary>
     public Task<IBrowserContext> NewContextAsync(BrowserNewContextOptions? options = null) =>
-        Browser.NewContextAsync(ApplyDefaultNoViewport(options));
+        LicenseGuard.GuardAsync(() => Browser.NewContextAsync(ApplyDefaultNoViewport(options)), _denialPath);
 
     /// <summary>
     /// Create a new page. When humanize is enabled the returned <see cref="IPage"/> is a
@@ -78,7 +83,7 @@ public sealed class CloakBrowserHandle : IAsyncDisposable
     /// are automatically humanized.
     /// </summary>
     public Task<IPage> NewPageAsync(BrowserNewPageOptions? options = null) =>
-        Browser.NewPageAsync(ApplyDefaultNoViewport(options));
+        LicenseGuard.GuardAsync(() => Browser.NewPageAsync(ApplyDefaultNoViewport(options)), _denialPath);
 
     /// <summary>
     /// Create a new page wrapped in an explicit <see cref="HumanPage"/> with this
@@ -107,6 +112,32 @@ public sealed class CloakBrowserHandle : IAsyncDisposable
 }
 
 /// <summary>
+/// Converts a post-handshake license denial into a clear <see cref="CloakBrowserLicenseError"/>.
+/// A denial that lands after Playwright connected kills the browser without a launch
+/// failure; the user's next call would throw a bare TargetClosedError. On any error we
+/// check the denial file the binary wrote and re-throw as a license error when a code is
+/// present — otherwise the original exception propagates, so a genuine crash is never
+/// mislabelled. Mirrors Python _install_license_guard / JS installLicenseGuard.
+/// </summary>
+internal static class LicenseGuard
+{
+    public static async Task<T> GuardAsync<T>(Func<Task<T>> op, string? denialPath)
+    {
+        try
+        {
+            return await op().ConfigureAwait(false);
+        }
+        catch (Exception) when (denialPath != null)
+        {
+            var code = License.ReadDenialFile(denialPath);
+            var lic = code.HasValue ? License.LicenseErrorForCode(code.Value) : null;
+            if (lic != null) throw lic;
+            throw;
+        }
+    }
+}
+
+/// <summary>
 /// A launched stealth browser context. Owns the underlying Playwright instance (and,
 /// for non-persistent contexts, the browser) and cleans them up on <see cref="CloseAsync"/>.
 /// </summary>
@@ -117,6 +148,7 @@ public sealed class CloakContextHandle : IAsyncDisposable
     private readonly bool _humanize;
     private readonly HumanConfig? _humanCfg;
     private readonly IBrowserContext _rawContext;
+    private readonly string? _denialPath;
 
     /// <summary>
     /// The Playwright browser context. When humanize is enabled this is a transparent
@@ -130,13 +162,14 @@ public sealed class CloakContextHandle : IAsyncDisposable
     public IBrowserContext RawContext => _rawContext;
 
     internal CloakContextHandle(IPlaywright playwright, IBrowser? browser, IBrowserContext context,
-        bool humanize, HumanConfig? humanCfg)
+        bool humanize, HumanConfig? humanCfg, string? denialPath = null)
     {
         _playwright = playwright;
         _browser = browser;
         _rawContext = context;
         _humanize = humanize;
         _humanCfg = humanCfg;
+        _denialPath = denialPath;
         Context = humanize ? Wrappers.Humanize.Context(context, humanCfg ?? new HumanConfig()) : context;
     }
 
@@ -144,7 +177,8 @@ public sealed class CloakContextHandle : IAsyncDisposable
     /// Create a new page. When humanize is enabled the returned <see cref="IPage"/> is a
     /// transparent humanizing wrapper - standard Playwright calls are auto-humanized.
     /// </summary>
-    public Task<IPage> NewPageAsync() => Context.NewPageAsync();
+    public Task<IPage> NewPageAsync() =>
+        LicenseGuard.GuardAsync(() => Context.NewPageAsync(), _denialPath);
 
     /// <summary>
     /// Create a new page wrapped in an explicit <see cref="HumanPage"/> with this

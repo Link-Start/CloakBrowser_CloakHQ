@@ -32,7 +32,11 @@ from .download import ensure_binary
 from .license import (
     CloakBrowserLicenseError,
     build_launch_env,
+    license_error_for_code,
     license_error_message,
+    mint_denial_file,
+    read_denial_file,
+    resolve_license_key,
 )
 from .human.config import HumanConfigOverrides, HumanPreset
 from .widevine import seed_widevine_hint
@@ -49,6 +53,71 @@ def _license_error(exc: BaseException) -> CloakBrowserLicenseError | None:
     """
     msg = license_error_message(str(exc))
     return CloakBrowserLicenseError(msg) if msg is not None else None
+
+
+def _install_license_guard(target: Any, denial_path: str, method_names: tuple[str, ...]) -> None:
+    """Wrap sync methods so a post-handshake license denial surfaces cleanly.
+
+    A denial that lands after Playwright connected kills the browser without a
+    launch failure; the user's next call would raise a bare TargetClosedError.
+    Each wrapped method, on any exception, checks the denial file the binary
+    wrote (``denial_path``) and re-raises as CloakBrowserLicenseError when a
+    license code is present — otherwise the original error propagates unchanged,
+    so a genuine crash is never mislabelled.
+    """
+    for name in method_names:
+        original = getattr(target, name, None)
+        if not callable(original):
+            continue
+
+        def make(original: Any) -> Any:
+            def guarded(*args: Any, **kwargs: Any) -> Any:
+                try:
+                    return original(*args, **kwargs)
+                except Exception as exc:
+                    code = read_denial_file(denial_path)
+                    lic = license_error_for_code(code) if code is not None else None
+                    if lic is not None:
+                        raise lic from exc
+                    raise
+            return guarded
+
+        setattr(target, name, make(original))
+
+
+def _install_license_guard_async(target: Any, denial_path: str, method_names: tuple[str, ...]) -> None:
+    """Async variant of :func:`_install_license_guard`."""
+    for name in method_names:
+        original = getattr(target, name, None)
+        if not callable(original):
+            continue
+
+        def make(original: Any) -> Any:
+            async def guarded(*args: Any, **kwargs: Any) -> Any:
+                try:
+                    return await original(*args, **kwargs)
+                except Exception as exc:
+                    code = read_denial_file(denial_path)
+                    lic = license_error_for_code(code) if code is not None else None
+                    if lic is not None:
+                        raise lic from exc
+                    raise
+            return guarded
+
+        setattr(target, name, make(original))
+
+
+# Navigation entry points guarded on a persistent context's already-open page(s).
+# A persistent context arrives with pages[0] open, so a post-handshake denial is
+# hit on the first navigation, not on new_page. This is the realistic first-call
+# set (navigation + waits); the guard passes through unrelated errors untouched.
+_PERSISTENT_PAGE_NAV_METHODS = (
+    "goto",
+    "reload",
+    "wait_for_load_state",
+    "wait_for_url",
+    "wait_for_selector",
+)
 
 
 # Sentinel to distinguish "viewport not provided" from "viewport=None" (disable emulation)
@@ -231,7 +300,8 @@ def launch(
 
     logger.debug("Launching stealth Chromium (headless=%s, args=%d)", headless, len(chrome_args))
 
-    launch_env = build_launch_env(license_key, user_env=kwargs.pop("env", None))
+    denial_path = mint_denial_file() if resolve_license_key(license_key) else None
+    launch_env = build_launch_env(license_key, user_env=kwargs.pop("env", None), status_file=denial_path)
     env_kwargs = {} if launch_env is None else {"env": launch_env}
 
     pw = sync_playwright().start()
@@ -268,6 +338,13 @@ def launch(
             pw.stop()
 
     browser.close = _close_with_cleanup
+
+    # Convert a post-handshake license denial into a clear error on the user's
+    # first call. Installed before the wraps below so it sits closest to the
+    # real call. Stash the path so launch_context() can guard its context too.
+    if denial_path:
+        browser._cloak_denial_path = denial_path
+        _install_license_guard(browser, denial_path, ("new_page", "new_context"))
 
     # Default new_page()/new_context() to no_viewport for headed (page tracks the
     # real window) and for headless on binaries that report coherent dimensions
@@ -350,7 +427,8 @@ async def launch_async(  # noqa: C901
 
     logger.debug("Launching stealth Chromium async (headless=%s, args=%d)", headless, len(chrome_args))
 
-    launch_env = build_launch_env(license_key, user_env=kwargs.pop("env", None))
+    denial_path = mint_denial_file() if resolve_license_key(license_key) else None
+    launch_env = build_launch_env(license_key, user_env=kwargs.pop("env", None), status_file=denial_path)
     env_kwargs = {} if launch_env is None else {"env": launch_env}
 
     pw = await async_playwright().start()
@@ -387,6 +465,12 @@ async def launch_async(  # noqa: C901
             await pw.stop()
 
     browser.close = _close_with_cleanup
+
+    # Convert a post-handshake license denial into a clear error on first use
+    # (see launch()). Stash the path for launch_context_async().
+    if denial_path:
+        browser._cloak_denial_path = denial_path
+        _install_license_guard_async(browser, denial_path, ("new_page", "new_context"))
 
     # Default new_page()/new_context() to no_viewport for headed and qualifying
     # headless binaries (see launch()).
@@ -501,7 +585,8 @@ def launch_persistent_context(
 
     # Resolve env for the browser process (license key injection, if needed)
     user_env = context_kwargs.pop("env", None)
-    launch_env = build_launch_env(license_key, user_env=user_env)
+    denial_path = mint_denial_file() if resolve_license_key(license_key) else None
+    launch_env = build_launch_env(license_key, user_env=user_env, status_file=denial_path)
     if launch_env is not None:
         context_kwargs["env"] = launch_env
 
@@ -541,6 +626,16 @@ def launch_persistent_context(
             pw.stop()
 
     context.close = _close_with_cleanup
+
+    # The persistent path hands back a context, so guard its new_page (see launch()).
+    if denial_path:
+        _install_license_guard(context, denial_path, ("new_page",))
+        # A persistent context arrives with a page already open, so the user
+        # navigates pages[0] directly and never calls new_page. Guard the
+        # existing pages' navigation entry points too, or a post-handshake denial
+        # surfaces as a bare TargetClosedError on that first navigation.
+        for _pg in context.pages:
+            _install_license_guard(_pg, denial_path, _PERSISTENT_PAGE_NAV_METHODS)
 
     # Human-like behavioral patching
     if humanize:
@@ -652,7 +747,8 @@ async def launch_persistent_context_async(
 
     # Resolve env for the browser process (license key injection, if needed)
     user_env = context_kwargs.pop("env", None)
-    launch_env = build_launch_env(license_key, user_env=user_env)
+    denial_path = mint_denial_file() if resolve_license_key(license_key) else None
+    launch_env = build_launch_env(license_key, user_env=user_env, status_file=denial_path)
     if launch_env is not None:
         context_kwargs["env"] = launch_env
 
@@ -692,6 +788,15 @@ async def launch_persistent_context_async(
             await pw.stop()
 
     context.close = _close_with_cleanup
+
+    # The persistent path hands back a context, so guard its new_page (see launch()).
+    if denial_path:
+        _install_license_guard_async(context, denial_path, ("new_page",))
+        # A persistent context arrives with a page already open (see the sync
+        # variant): guard the existing pages' navigation entry points so a
+        # post-handshake denial on pages[0] surfaces cleanly.
+        for _pg in context.pages:
+            _install_license_guard_async(_pg, denial_path, _PERSISTENT_PAGE_NAV_METHODS)
 
     # Human-like behavioral patching (async variant)
     if humanize:
@@ -799,6 +904,12 @@ def launch_context(
             browser.close()
 
     context.close = _close_context_with_cleanup
+
+    # browser.new_context above is already guarded by launch(); also guard the
+    # context's new_page for a denial that lands after the context is created.
+    denial_path = getattr(browser, "_cloak_denial_path", None)
+    if denial_path:
+        _install_license_guard(context, denial_path, ("new_page",))
 
     # Human-like behavioral patching
     if humanize:
@@ -931,6 +1042,12 @@ async def launch_context_async(
             await browser.close()
 
     context.close = _close_context_with_cleanup
+
+    # browser.new_context above is already guarded by launch_async(); also guard
+    # the context's new_page for a denial that lands after context creation.
+    denial_path = getattr(browser, "_cloak_denial_path", None)
+    if denial_path:
+        _install_license_guard_async(context, denial_path, ("new_page",))
 
     # Human-like behavioral patching (async variant)
     if humanize:
